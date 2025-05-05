@@ -1,7 +1,7 @@
 ﻿# BootDestinationSelector.ps1
 # Script to select which OS installation to boot to next and restart
 # Author: Slavomir Prkno
-# Version: 1.6
+# Version: 1.7
 # Description: Control which OS your system boots into for the next restart only
 
 #region Auto-Elevation
@@ -97,6 +97,9 @@ function Get-BootEntries {
                 IsBootable = $false
                 IsWindows = $false
                 IsLinux = $false
+                IsUbuntu = $false
+                UbuntuDrive = ""
+                PartitionPath = ""
             }
         }
         elseif ($line -match "^-+$") {
@@ -121,18 +124,36 @@ function Get-BootEntries {
                 if ($currentEntry.Description -match "Windows|WINDOWS") {
                     $currentEntry.IsWindows = $true
                 }
-                elseif ($currentEntry.Description -match "Linux|LINUX|Ubuntu|Debian|Fedora|GRUB|Arch|Mint|openSUSE|CentOS|Red Hat") {
+                elseif ($currentEntry.Description -match "Ubuntu|ubuntu|UBUNTU") {
+                    $currentEntry.IsLinux = $true
+                    $currentEntry.IsUbuntu = $true
+                }
+                elseif ($currentEntry.Description -match "Linux|LINUX|Debian|Fedora|GRUB|Arch|Mint|openSUSE|CentOS|Red Hat") {
                     $currentEntry.IsLinux = $true
                 }
             }
             elseif ($line -match "^\s*device\s+(.+)$") {
                 $currentEntry.Device = $matches[1].Trim()
+                
+                # Extract partition path if this is an Ubuntu entry
+                if ($currentEntry.IsUbuntu -and $currentEntry.Device -match "\\Device\\(.+)") {
+                    $currentEntry.PartitionPath = $matches[1]
+                    
+                    # Extract drive letter if available
+                    if ($currentEntry.Device -match "partition=([A-Z]:)") {
+                        $currentEntry.UbuntuDrive = $matches[1]
+                    }
+                }
             }
             elseif ($line -match "^\s*path\s+(.+)$") {
                 $currentEntry.Path = $matches[1].Trim()
                 
                 # Additional check for Linux boot loaders
-                if ($currentEntry.Path -match "\.efi$|grub|grubx64|shimx64") {
+                if ($currentEntry.Path -match "\\EFI\\ubuntu\\shimx64\.efi") {
+                    $currentEntry.IsLinux = $true
+                    $currentEntry.IsUbuntu = $true
+                }
+                elseif ($currentEntry.Path -match "\.efi$|grub|grubx64|shimx64") {
                     $currentEntry.IsLinux = $true
                 }
             }
@@ -153,6 +174,23 @@ function Get-BootEntries {
         $_.IsBootable -and 
         $_.Description -notmatch "^(Windows Memory Diagnostic|Windows Resume Application)$" -and
         $_.Description -ne ""
+    }
+    
+    # Find any Ubuntu entries that use shimx64.efi and create alternative entries with grubx64.efi
+    $ubuntuEntries = $bootableEntries | Where-Object { 
+        $_.IsUbuntu -and $_.Path -match "\\EFI\\ubuntu\\shimx64\.efi" 
+    }
+    
+    # Add alternative GRUB entries for Ubuntu
+    foreach ($ubuntuEntry in $ubuntuEntries) {
+        # Create a clone of the entry but with grubx64.efi instead of shimx64.efi
+        $grubEntry = $ubuntuEntry.Clone()
+        $grubEntry.Path = $grubEntry.Path -replace "shimx64\.efi", "grubx64.efi"
+        $grubEntry.Description = "$($grubEntry.Description) (GRUB direct)"
+        $grubEntry.IsAlternative = $true
+        
+        # Add to the list of entries
+        $bootableEntries += $grubEntry
     }
     
     # Return entries in original order (no sorting)
@@ -200,16 +238,28 @@ function Show-Menu {
         
         # Add OS type indicator
         if ($entry.IsLinux) {
-            $osType = "Linux"
-            $fgColor = "Magenta"  # Use different color for Linux
+            if ($entry.IsUbuntu) {
+                if ($entry.IsAlternative) {
+                    $fgColor = "DarkGreen"  # Alternative Ubuntu entry
+                }
+                else {
+                    $fgColor = "Magenta"    # Regular Ubuntu
+                }
+            }
+            else {
+                $fgColor = "Magenta"        # Other Linux
+            }
         }
         elseif ($entry.IsWindows) {
-            $osType = "Windows"
-            $fgColor = "Green"    # Keep Windows green
+            if ($entry.Description -match "Recovery|recovery") {
+                $fgColor = "Cyan"           # Recovery in cyan
+            }
+            else {
+                $fgColor = "Green"          # Keep Windows green
+            }
         }
         else {
-            $osType = "Other OS"
-            $fgColor = "Cyan"     # Use cyan for other OS types
+            $fgColor = "Blue"               # Other OS types
         }
         
         $indicatorStr = if ($indicators.Count -gt 0) { " (" + ($indicators -join ", ") + ")" } else { "" }
@@ -227,6 +277,7 @@ function Show-Menu {
             $pathInfo = $entry.Path -replace "\\", "\"
             Write-Host "    Path: $pathInfo" -ForegroundColor Gray
         }
+        
         Write-Host ""
     }
     
@@ -266,6 +317,78 @@ function Show-Menu {
         
         # Invalid selection
         Write-Host "Invalid selection. Please try again." -ForegroundColor Red
+    }
+}
+
+<#
+.SYNOPSIS
+    Creates a temporary GRUB boot entry for Ubuntu.
+.DESCRIPTION
+    Creates a temporary boot entry that directly uses GRUB instead of SHIM.
+.PARAMETER UbuntuDevice
+    The device path of the Ubuntu installation.
+.PARAMETER Description
+    Description for the new boot entry.
+.OUTPUTS
+    Boolean indicating success or failure.
+#>
+function New-UbuntuGrubEntry {
+    param (
+        [Parameter(Mandatory=$true)]
+        [string]$UbuntuDevice,
+        
+        [Parameter(Mandatory=$true)]
+        [string]$Description
+    )
+    
+    try {
+        # Create a new boot entry that uses grubx64.efi directly
+        Write-Host "Creating temporary GRUB boot entry for Ubuntu..." -ForegroundColor Yellow
+        
+        # First, find if the EFI partition is mounted
+        $efiPartitionInfo = $UbuntuDevice -replace "\\Device\\", ""
+        
+        # Create the bcdedit command
+        $tempId = "{" + [System.Guid]::NewGuid().ToString() + "}"
+        
+        # Add a new EFI entry
+        # Parameters:
+        # /create - Create a new entry
+        # /d - Description
+        # /application osloader - Application type
+        $output = bcdedit /create $tempId /d "$Description" /application osloader 2>&1
+        
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to create boot entry. Error code: $LASTEXITCODE. Output: $output"
+        }
+        
+        # Set the device path
+        $output = bcdedit /set $tempId device partition=$UbuntuDevice 2>&1
+        
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to set device. Error code: $LASTEXITCODE. Output: $output"
+        }
+        
+        # Set the path to grubx64.efi
+        $output = bcdedit /set $tempId path \EFI\ubuntu\grubx64.efi 2>&1
+        
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to set path. Error code: $LASTEXITCODE. Output: $output"
+        }
+        
+        # Set as a temporary entry for the next boot only
+        $output = bcdedit /bootsequence $tempId /addfirst 2>&1
+        
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to set boot sequence. Error code: $LASTEXITCODE. Output: $output"
+        }
+        
+        Write-Host "Temporary GRUB boot entry created successfully." -ForegroundColor Green
+        return $true
+    }
+    catch {
+        Write-Host "Error creating GRUB entry: $_" -ForegroundColor Red
+        return $false
     }
 }
 
@@ -362,55 +485,81 @@ function Set-OneTimeBoot {
     
     Write-Host "`nSetting one-time boot sequence to $($Entry.Description)..." -ForegroundColor Yellow
     
-    try {
-        # Execute bcdedit command with proper error handling
-        $output = bcdedit /bootsequence $Entry.Identifier /addfirst 2>&1
+    # Check if this is a regular Ubuntu entry (shimx64.efi)
+    $useGrubDirect = $false
+    if ($Entry.IsUbuntu -and $Entry.Path -match "shimx64\.efi" -and -not $Entry.IsAlternative) {
+        Write-Host "`nThis Ubuntu entry uses SHIM (shimx64.efi) which may not boot correctly on your system." -ForegroundColor Yellow
+        Write-Host "Would you like to use GRUB (grubx64.efi) directly instead?" -ForegroundColor Yellow
+        Write-Host "This often fixes boot issues with Ubuntu on systems like yours." -ForegroundColor Yellow
         
-        if ($LASTEXITCODE -ne 0) {
-            throw "bcdedit command failed with exit code $LASTEXITCODE. Output: $output"
-        }
+        $useGrub = Read-Host "Use GRUB directly? (Y/n)"
         
-        Write-Host "Boot sequence successfully set." -ForegroundColor Green
-        Write-Host "System will boot to $($Entry.Description) on next restart only." -ForegroundColor Green
-        
-        # Always check BitLocker on the current system drive
-        # This allows suspending BitLocker when booting to Linux or other non-Windows OS
-        $bitlockerSuspended = Manage-BitLocker -MountPoint $env:SystemDrive
-        
-        # Ask for confirmation before restarting with improved default handling
-        $confirmRestart = Read-Host "`nSystem will restart now and boot to $($Entry.Description). Continue? (Y/n)"
-        
-        # Default to yes if empty input
-        if ([string]::IsNullOrWhiteSpace($confirmRestart) -or 
-            $confirmRestart.ToLower() -eq "y") {
-            
-            # Countdown timer for restart
-            $seconds = 5
-            Write-Host "`nRestarting system in $seconds seconds..." -ForegroundColor Yellow
-            
-            while ($seconds -gt 0) {
-                Write-Host "`rCountdown: $seconds..." -ForegroundColor Red -NoNewline
-                Start-Sleep -Seconds 1
-                $seconds--
-            }
-            
-            Write-Host "`rSystem is restarting now. Goodbye!               " -ForegroundColor Red
-            
-            # Initiate restart
-            shutdown /r /t 0
-        }
-        else {
-            Write-Host "`nRestart cancelled. The boot sequence has been set for the next restart." -ForegroundColor Cyan
-            Write-Host "When you're ready to restart, use the normal Windows restart procedure." -ForegroundColor Cyan
-            
-            if ($bitlockerSuspended) {
-                Write-Host "NOTE: BitLocker has been suspended for one reboot." -ForegroundColor Yellow
-            }
+        if ([string]::IsNullOrWhiteSpace($useGrub) -or $useGrub.ToLower() -eq "y") {
+            $useGrubDirect = $true
         }
     }
-    catch {
-        Write-Host "Error: $_" -ForegroundColor Red
-        return $false
+    
+    if ($useGrubDirect) {
+        # Create a temporary GRUB entry for Ubuntu
+        $grubCreated = New-UbuntuGrubEntry -UbuntuDevice $Entry.Device -Description "Ubuntu GRUB (Temporary)"
+        
+        if (-not $grubCreated) {
+            Write-Host "Failed to create temporary GRUB entry. Falling back to original entry..." -ForegroundColor Red
+            $useGrubDirect = $false
+        }
+    }
+    
+    if (-not $useGrubDirect) {
+        try {
+            # Execute bcdedit command with proper error handling
+            $output = bcdedit /bootsequence $Entry.Identifier /addfirst 2>&1
+            
+            if ($LASTEXITCODE -ne 0) {
+                throw "bcdedit command failed with exit code $LASTEXITCODE. Output: $output"
+            }
+            
+            Write-Host "Boot sequence successfully set." -ForegroundColor Green
+            Write-Host "System will boot to $($Entry.Description) on next restart only." -ForegroundColor Green
+        }
+        catch {
+            Write-Host "Error: $_" -ForegroundColor Red
+            return $false
+        }
+    }
+    
+    # Always check BitLocker on the current system drive
+    # This allows suspending BitLocker when booting to Linux or other non-Windows OS
+    $bitlockerSuspended = Manage-BitLocker -MountPoint $env:SystemDrive
+    
+    # Ask for confirmation before restarting with improved default handling
+    $confirmRestart = Read-Host "`nSystem will restart now and boot to $($Entry.Description). Continue? (Y/n)"
+    
+    # Default to yes if empty input
+    if ([string]::IsNullOrWhiteSpace($confirmRestart) -or 
+        $confirmRestart.ToLower() -eq "y") {
+        
+        # Countdown timer for restart
+        $seconds = 5
+        Write-Host "`nRestarting system in $seconds seconds..." -ForegroundColor Yellow
+        
+        while ($seconds -gt 0) {
+            Write-Host "`rCountdown: $seconds..." -ForegroundColor Red -NoNewline
+            Start-Sleep -Seconds 1
+            $seconds--
+        }
+        
+        Write-Host "`rSystem is restarting now. Goodbye!               " -ForegroundColor Red
+        
+        # Initiate restart
+        shutdown /r /t 0
+    }
+    else {
+        Write-Host "`nRestart cancelled. The boot sequence has been set for the next restart." -ForegroundColor Cyan
+        Write-Host "When you're ready to restart, use the normal Windows restart procedure." -ForegroundColor Cyan
+        
+        if ($bitlockerSuspended) {
+            Write-Host "NOTE: BitLocker has been suspended for one reboot." -ForegroundColor Yellow
+        }
     }
     
     return $true
