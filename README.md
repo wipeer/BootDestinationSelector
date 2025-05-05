@@ -38,7 +38,6 @@ Perfect for:
 ![Main Selection Screen](screenshots/main-screen.png)
 ![BitLocker Option](screenshots/bitlocker-option.png)
 
-*(Replace with actual screenshots)*
 
 ## Requirements
 
