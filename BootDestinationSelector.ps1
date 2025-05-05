@@ -1,7 +1,7 @@
 ﻿# BootDestinationSelector.ps1
 # Script to select which OS installation to boot to next and restart
 # Author: Slavomir Prkno
-# Version: 1.5
+# Version: 1.6
 # Description: Control which OS your system boots into for the next restart only
 
 #region Auto-Elevation
@@ -95,6 +95,8 @@ function Get-BootEntries {
                 Properties = @{}
                 IsDefault = $false
                 IsBootable = $false
+                IsWindows = $false
+                IsLinux = $false
             }
         }
         elseif ($line -match "^-+$") {
@@ -114,12 +116,25 @@ function Get-BootEntries {
                 $currentEntry.Description = $matches[1].Trim()
                 # Mark as bootable if it has a description
                 $currentEntry.IsBootable = $true
+                
+                # Detect if it's Windows or Linux
+                if ($currentEntry.Description -match "Windows|WINDOWS") {
+                    $currentEntry.IsWindows = $true
+                }
+                elseif ($currentEntry.Description -match "Linux|LINUX|Ubuntu|Debian|Fedora|GRUB|Arch|Mint|openSUSE|CentOS|Red Hat") {
+                    $currentEntry.IsLinux = $true
+                }
             }
             elseif ($line -match "^\s*device\s+(.+)$") {
                 $currentEntry.Device = $matches[1].Trim()
             }
             elseif ($line -match "^\s*path\s+(.+)$") {
                 $currentEntry.Path = $matches[1].Trim()
+                
+                # Additional check for Linux boot loaders
+                if ($currentEntry.Path -match "\.efi$|grub|grubx64|shimx64") {
+                    $currentEntry.IsLinux = $true
+                }
             }
             elseif ($line -match "^\s*(\w+)\s+(.+)$") {
                 # Store other properties
@@ -183,9 +198,23 @@ function Show-Menu {
             $indicators += "Default"
         }
         
+        # Add OS type indicator
+        if ($entry.IsLinux) {
+            $osType = "Linux"
+            $fgColor = "Magenta"  # Use different color for Linux
+        }
+        elseif ($entry.IsWindows) {
+            $osType = "Windows"
+            $fgColor = "Green"    # Keep Windows green
+        }
+        else {
+            $osType = "Other OS"
+            $fgColor = "Cyan"     # Use cyan for other OS types
+        }
+        
         $indicatorStr = if ($indicators.Count -gt 0) { " (" + ($indicators -join ", ") + ")" } else { "" }
         
-        Write-Host "[$($i + 1)] $($entry.Description)$indicatorStr" -ForegroundColor Green
+        Write-Host "[$($i + 1)] $($entry.Description)$indicatorStr" -ForegroundColor $fgColor
         
         # Show device info with better formatting
         if (-not [string]::IsNullOrWhiteSpace($entry.Device)) {
@@ -257,34 +286,6 @@ function Manage-BitLocker {
         [string]$MountPoint
     )
     
-    # Skip BitLocker check for non-standard paths (like VHDs with locate=)
-    if ($MountPoint -match "locate=") {
-        Write-Host "Skipping BitLocker check for non-standard path entry." -ForegroundColor Yellow
-        return $false
-    }
-    
-    # Extract drive letter for standard paths
-    $driveLetter = $null
-    if ($MountPoint -match "^[A-Za-z]:") {
-        # For C: style paths
-        $driveLetter = $MountPoint.Substring(0, 2)
-    }
-    elseif ($MountPoint -match "partition=([A-Za-z]:)") {
-        # For partition=C: style paths
-        $driveLetter = $matches[1]
-    }
-    elseif ($MountPoint -match "\\Device\\HarddiskVolume\d+") {
-        # For device path format, we can't easily determine drive letter
-        Write-Host "BitLocker check skipped for device path: $MountPoint" -ForegroundColor Yellow
-        return $false
-    }
-    
-    # If we couldn't determine a drive letter, skip BitLocker check
-    if (-not $driveLetter) {
-        Write-Host "BitLocker check skipped (couldn't determine drive letter)." -ForegroundColor Yellow
-        return $false
-    }
-    
     try {
         # Check if BitLocker cmdlets are available
         $bitlockerCmdlet = Get-Command -Name "Get-BitLockerVolume" -ErrorAction SilentlyContinue
@@ -294,8 +295,9 @@ function Manage-BitLocker {
             return $false
         }
         
-        # Try to get BitLocker status
-        $bitlockerVolume = Get-BitLockerVolume -MountPoint $driveLetter -ErrorAction SilentlyContinue
+        # Try to get BitLocker status for system drive (current Windows)
+        $systemDrive = $env:SystemDrive
+        $bitlockerVolume = Get-BitLockerVolume -MountPoint $systemDrive -ErrorAction SilentlyContinue
         
         # Skip if BitLocker isn't installed or if command fails
         if ($null -eq $bitlockerVolume) {
@@ -303,12 +305,12 @@ function Manage-BitLocker {
             return $false
         }
         
-        # Check if BitLocker is enabled on the selected drive
+        # Check if BitLocker is enabled on the system drive
         if ($bitlockerVolume.VolumeStatus -eq "FullyEncrypted" -or 
             $bitlockerVolume.VolumeStatus -eq "EncryptionInProgress" -or
             $bitlockerVolume.ProtectionStatus -eq "On") {
             
-            Write-Host "`nBitLocker is enabled on drive $driveLetter" -ForegroundColor Yellow
+            Write-Host "`nBitLocker is enabled on your current system drive ($systemDrive)" -ForegroundColor Yellow
             $suspendBitlocker = Read-Host "Would you like to suspend BitLocker protection for one reboot? (Y/n)"
             
             # Default to yes if empty input
@@ -316,7 +318,7 @@ function Manage-BitLocker {
                 $suspendBitlocker.ToLower() -eq "y") {
                 
                 Write-Host "Suspending BitLocker for one reboot cycle..." -ForegroundColor Yellow
-                Suspend-BitLocker -MountPoint $driveLetter -RebootCount 1
+                Suspend-BitLocker -MountPoint $systemDrive -RebootCount 1
                 
                 if ($LASTEXITCODE -eq 0) {
                     Write-Host "BitLocker suspended successfully for one reboot." -ForegroundColor Green
@@ -333,7 +335,7 @@ function Manage-BitLocker {
             }
         }
         else {
-            Write-Host "BitLocker is not enabled on drive $driveLetter." -ForegroundColor Gray
+            Write-Host "BitLocker is not enabled on your current system drive ($systemDrive)." -ForegroundColor Gray
             return $false
         }
     }
@@ -371,16 +373,9 @@ function Set-OneTimeBoot {
         Write-Host "Boot sequence successfully set." -ForegroundColor Green
         Write-Host "System will boot to $($Entry.Description) on next restart only." -ForegroundColor Green
         
-        # Check for BitLocker on the drive if it's not a virtual disk or special path
-        $bitlockerSuspended = $false
-        
-        if (-not [string]::IsNullOrWhiteSpace($Entry.Device)) {
-            $bitlockerSuspended = Manage-BitLocker -MountPoint $Entry.Device
-        }
-        elseif ($Entry.Identifier -eq "{current}") {
-            # If current OS, get its drive letter
-            $bitlockerSuspended = Manage-BitLocker -MountPoint $env:SystemDrive
-        }
+        # Always check BitLocker on the current system drive
+        # This allows suspending BitLocker when booting to Linux or other non-Windows OS
+        $bitlockerSuspended = Manage-BitLocker -MountPoint $env:SystemDrive
         
         # Ask for confirmation before restarting with improved default handling
         $confirmRestart = Read-Host "`nSystem will restart now and boot to $($Entry.Description). Continue? (Y/n)"
