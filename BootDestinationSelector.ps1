@@ -1,8 +1,8 @@
 ﻿# BootDestinationSelector.ps1
-# Script to select which Windows installation to boot to next and restart
+# Script to select which OS installation to boot to next and restart
 # Author: Slavomir Prkno
-# Version: 1.4
-# Description: Allows selecting a Windows installation for one-time boot with optional BitLocker suspension
+# Version: 1.5
+# Description: Control which OS your system boots into for the next restart only
 
 #region Auto-Elevation
 # Check if script is running as Administrator and self-elevate if not
@@ -45,21 +45,21 @@ if (-not $principal.IsInRole($adminRole)) {
 #region Functions
 <#
 .SYNOPSIS
-    Retrieves Windows boot entries from the system.
+    Retrieves available boot entries from the system.
 .DESCRIPTION
-    Parses the output of bcdedit /enum to extract information about Windows boot entries.
-    Only returns Windows Boot Loader entries (actual OS installations).
+    Parses the output of bcdedit /enum to extract information about all boot entries,
+    including Windows installations, Linux, and other operating systems.
 .OUTPUTS
     Array of hashtables containing boot entry information.
 #>
 function Get-BootEntries {
     # Get boot entries using bcdedit with error handling
     try {
-        $bcdeditOutput = bcdedit /enum 2>&1
+        $bcdeditOutput = bcdedit /enum all 2>&1
         
         # Check if bcdedit returned an error
         if ($LASTEXITCODE -ne 0 -or $bcdeditOutput -match "error") {
-            throw "Failed to execute bcdedit /enum. Error code: $LASTEXITCODE. Output: $bcdeditOutput"
+            throw "Failed to execute bcdedit /enum all. Error code: $LASTEXITCODE. Output: $bcdeditOutput"
         }
         
         # Convert to string if it's not already
@@ -79,7 +79,7 @@ function Get-BootEntries {
         if ([string]::IsNullOrWhiteSpace($line)) { continue }
         
         # Start of a new entry
-        if ($line -match "^Windows Boot (Manager|Loader)$") {
+        if ($line -match "^(Windows Boot (Manager|Loader)|EFI.+|Boot(mgr|mgfw)|Legacy.+|Resume.+|Firmware.+)") {
             # Save previous entry if exists
             if ($null -ne $currentEntry) {
                 $entries += $currentEntry
@@ -94,6 +94,7 @@ function Get-BootEntries {
                 Path = ""
                 Properties = @{}
                 IsDefault = $false
+                IsBootable = $false
             }
         }
         elseif ($line -match "^-+$") {
@@ -111,6 +112,8 @@ function Get-BootEntries {
             }
             elseif ($line -match "^\s*description\s+(.+)$") {
                 $currentEntry.Description = $matches[1].Trim()
+                # Mark as bootable if it has a description
+                $currentEntry.IsBootable = $true
             }
             elseif ($line -match "^\s*device\s+(.+)$") {
                 $currentEntry.Device = $matches[1].Trim()
@@ -130,18 +133,22 @@ function Get-BootEntries {
         $entries += $currentEntry
     }
     
-    # Return only Windows Boot Loader entries (actual OS installations)
-    $loaderEntries = $entries | Where-Object { $_.Type -eq "Windows Boot Loader" }
+    # Filter bootable entries - anything with a description that isn't resume or memory test
+    $bootableEntries = $entries | Where-Object { 
+        $_.IsBootable -and 
+        $_.Description -notmatch "^(Windows Memory Diagnostic|Windows Resume Application)$" -and
+        $_.Description -ne ""
+    }
     
     # Return entries in original order (no sorting)
-    return $loaderEntries
+    return $bootableEntries
 }
 
 <#
 .SYNOPSIS
     Displays an interactive menu for selecting a boot entry.
 .DESCRIPTION
-    Shows a formatted menu of available Windows boot entries and handles user selection.
+    Shows a formatted menu of available boot entries and handles user selection.
 .PARAMETER Entries
     Array of boot entry objects to display in the menu.
 .OUTPUTS
@@ -158,10 +165,10 @@ function Show-Menu {
     # Fixed header without using expressions that show in the output
     Write-Host "" 
     Write-Host "============================================================" -ForegroundColor Cyan
-    Write-Host "                  Windows Boot Selector                     " -ForegroundColor Cyan
+    Write-Host "                Boot Destination Selector                   " -ForegroundColor Cyan
     Write-Host "============================================================" -ForegroundColor Cyan
     
-    Write-Host "`nSelect the Windows installation to boot to for the next restart:" -ForegroundColor Yellow
+    Write-Host "`nSelect the OS installation to boot to for the next restart:" -ForegroundColor Yellow
     Write-Host "(System will return to default boot entry after this restart)`n" -ForegroundColor Yellow
     
     # Display entries with improved formatting
@@ -181,12 +188,16 @@ function Show-Menu {
         Write-Host "[$($i + 1)] $($entry.Description)$indicatorStr" -ForegroundColor Green
         
         # Show device info with better formatting
-        $deviceInfo = $entry.Device -replace "partition=", "Drive: "
-        Write-Host "    $deviceInfo" -ForegroundColor Gray
+        if (-not [string]::IsNullOrWhiteSpace($entry.Device)) {
+            $deviceInfo = $entry.Device -replace "partition=", "Drive: "
+            Write-Host "    $deviceInfo" -ForegroundColor Gray
+        }
         
-        # Show path in a friendly format
-        $pathInfo = $entry.Path -replace "\\", "\"
-        Write-Host "    Path: $pathInfo" -ForegroundColor Gray
+        # Show path in a friendly format if available
+        if (-not [string]::IsNullOrWhiteSpace($entry.Path)) {
+            $pathInfo = $entry.Path -replace "\\", "\"
+            Write-Host "    Path: $pathInfo" -ForegroundColor Gray
+        }
         Write-Host ""
     }
     
@@ -246,14 +257,45 @@ function Manage-BitLocker {
         [string]$MountPoint
     )
     
-    # Make sure mount point has the correct format
-    if (-not $MountPoint.EndsWith(":")) {
-        $MountPoint = $MountPoint + ":"
+    # Skip BitLocker check for non-standard paths (like VHDs with locate=)
+    if ($MountPoint -match "locate=") {
+        Write-Host "Skipping BitLocker check for non-standard path entry." -ForegroundColor Yellow
+        return $false
+    }
+    
+    # Extract drive letter for standard paths
+    $driveLetter = $null
+    if ($MountPoint -match "^[A-Za-z]:") {
+        # For C: style paths
+        $driveLetter = $MountPoint.Substring(0, 2)
+    }
+    elseif ($MountPoint -match "partition=([A-Za-z]:)") {
+        # For partition=C: style paths
+        $driveLetter = $matches[1]
+    }
+    elseif ($MountPoint -match "\\Device\\HarddiskVolume\d+") {
+        # For device path format, we can't easily determine drive letter
+        Write-Host "BitLocker check skipped for device path: $MountPoint" -ForegroundColor Yellow
+        return $false
+    }
+    
+    # If we couldn't determine a drive letter, skip BitLocker check
+    if (-not $driveLetter) {
+        Write-Host "BitLocker check skipped (couldn't determine drive letter)." -ForegroundColor Yellow
+        return $false
     }
     
     try {
-        # Try to get BitLocker status, will fail if BitLocker is not available
-        $bitlockerVolume = Get-BitLockerVolume -MountPoint $MountPoint -ErrorAction SilentlyContinue
+        # Check if BitLocker cmdlets are available
+        $bitlockerCmdlet = Get-Command -Name "Get-BitLockerVolume" -ErrorAction SilentlyContinue
+        
+        if ($null -eq $bitlockerCmdlet) {
+            Write-Host "BitLocker PowerShell module not available on this system." -ForegroundColor Yellow
+            return $false
+        }
+        
+        # Try to get BitLocker status
+        $bitlockerVolume = Get-BitLockerVolume -MountPoint $driveLetter -ErrorAction SilentlyContinue
         
         # Skip if BitLocker isn't installed or if command fails
         if ($null -eq $bitlockerVolume) {
@@ -266,7 +308,7 @@ function Manage-BitLocker {
             $bitlockerVolume.VolumeStatus -eq "EncryptionInProgress" -or
             $bitlockerVolume.ProtectionStatus -eq "On") {
             
-            Write-Host "`nBitLocker is enabled on drive $MountPoint" -ForegroundColor Yellow
+            Write-Host "`nBitLocker is enabled on drive $driveLetter" -ForegroundColor Yellow
             $suspendBitlocker = Read-Host "Would you like to suspend BitLocker protection for one reboot? (Y/n)"
             
             # Default to yes if empty input
@@ -274,7 +316,7 @@ function Manage-BitLocker {
                 $suspendBitlocker.ToLower() -eq "y") {
                 
                 Write-Host "Suspending BitLocker for one reboot cycle..." -ForegroundColor Yellow
-                Suspend-BitLocker -MountPoint $MountPoint -RebootCount 1
+                Suspend-BitLocker -MountPoint $driveLetter -RebootCount 1
                 
                 if ($LASTEXITCODE -eq 0) {
                     Write-Host "BitLocker suspended successfully for one reboot." -ForegroundColor Green
@@ -291,12 +333,12 @@ function Manage-BitLocker {
             }
         }
         else {
-            Write-Host "BitLocker is not enabled on drive $MountPoint." -ForegroundColor Gray
+            Write-Host "BitLocker is not enabled on drive $driveLetter." -ForegroundColor Gray
             return $false
         }
     }
     catch {
-        Write-Host "Error checking BitLocker status: $_" -ForegroundColor Red
+        Write-Host "BitLocker check error (skipping): $_" -ForegroundColor Yellow
         return $false
     }
 }
@@ -329,22 +371,16 @@ function Set-OneTimeBoot {
         Write-Host "Boot sequence successfully set." -ForegroundColor Green
         Write-Host "System will boot to $($Entry.Description) on next restart only." -ForegroundColor Green
         
-        # Check for BitLocker on the current drive
-        if ($Entry.Identifier -eq "{current}") {
-            # If current OS, get its drive letter (usually C:)
-            $driveToCheck = $env:SystemDrive
-        }
-        else {
-            # For other entries, extract drive letter from device property
-            $driveToCheck = $Entry.Device -replace '.*partition=', ''
-            if ($driveToCheck -match "\\Device\\HarddiskVolume\d+") {
-                # For device path format, just use C: as default since we can't easily map this
-                $driveToCheck = "C:"
-            }
-        }
+        # Check for BitLocker on the drive if it's not a virtual disk or special path
+        $bitlockerSuspended = $false
         
-        # Check and optionally suspend BitLocker
-        $bitlockerSuspended = Manage-BitLocker -MountPoint $driveToCheck
+        if (-not [string]::IsNullOrWhiteSpace($Entry.Device)) {
+            $bitlockerSuspended = Manage-BitLocker -MountPoint $Entry.Device
+        }
+        elseif ($Entry.Identifier -eq "{current}") {
+            # If current OS, get its drive letter
+            $bitlockerSuspended = Manage-BitLocker -MountPoint $env:SystemDrive
+        }
         
         # Ask for confirmation before restarting with improved default handling
         $confirmRestart = Read-Host "`nSystem will restart now and boot to $($Entry.Description). Continue? (Y/n)"
@@ -388,13 +424,13 @@ function Set-OneTimeBoot {
 
 #region Main Script
 try {
-    Write-Host "Scanning for Windows installations... Please wait." -ForegroundColor Cyan
+    Write-Host "Scanning for bootable OS installations... Please wait." -ForegroundColor Cyan
     
     # Get boot entries
     $bootEntries = Get-BootEntries
     
     if ($bootEntries.Count -eq 0) {
-        throw "No Windows boot entries found. This is unusual and may indicate a system configuration issue."
+        throw "No bootable OS entries found. This is unusual and may indicate a system configuration issue."
     }
     
     # Show menu and get selection
@@ -423,7 +459,6 @@ catch {
     Write-Host "1. Make sure you're running PowerShell as Administrator" -ForegroundColor Yellow
     Write-Host "2. Check if bcdedit.exe is accessible (it should be part of Windows)" -ForegroundColor Yellow
     Write-Host "3. Ensure your system boot configuration is not corrupted" -ForegroundColor Yellow
-    Write-Host "4. If BitLocker error: Verify BitLocker is enabled in Windows features" -ForegroundColor Yellow
     
     # Pause so error can be read
     Write-Host "`nPress any key to exit..." -ForegroundColor Cyan
